@@ -1,7 +1,5 @@
 import pandas as pd
-from langchain_core.tools import tool
 
-@tool
 def load_dataset(file_path: str) -> dict:
     """Load a CSV dataset and return basic preview information."""
     try:

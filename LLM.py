@@ -1,53 +1,68 @@
+import os
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import StrOutputParser
-from langchain_core.messages import HumanMessage, AIMessage
+from langgraph.prebuilt import create_react_agent
 
-chat_history = []
-
-query_1 = "hi I'm Nouman Ejaz, How are you?"
-response_1 = "Hey how are you doing, please to meet you nouman"
-
-chat_history.append(HumanMessage(content=query_1))
-chat_history.append(AIMessage(content=response_1))
+from tools.load_user_file import load_dataset
+from tools.get_dataframe_info import get_dataframe_info
+from tools.get_statistics import get_statistics
+from tools.get_missing_values import get_missing_values
+from tools.handle_missing_values import handle_missing_values
+from tools.generate_visualization import generate_visualization
 
 load_dotenv()
 
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.7,
-    max_tokens=384
-)
+SYSTEM_PROMPT = """You are an expert AI Data Scientist. Your job is to perform a full Exploratory Data Analysis (EDA) on datasets provided by the user.
 
-prompt = ChatPromptTemplate.from_messages([
-    (
-        "system",
-        """
-You are an expert AI Data Scientist. Your job is to perform Exploratory Data Analysis (EDA) on datasets provided by the user.
+Follow this exact sequence for every dataset:
 
-Guidelines:
-- The dataset provided by the user will be at most 10 MB.
-- Assume the dataset is typically in CSV format.
-- Your goal is to analyze the dataset and explain findings clearly so the user understands the data.
+1. Call load_dataset to preview the data (shape, columns, first rows).
+2. Call get_dataframe_info to understand structure (dtypes, null counts, memory).
+3. Call get_statistics to get descriptive stats, skewness, and kurtosis.
+4. Call get_missing_values to identify and assess all missing data.
+5. Call handle_missing_values with smart strategies per column:
+   - Numeric columns: use 'mean' if skew < 1, else use 'median'
+   - Categorical columns: use 'mode'
+   - Columns with > 50% missing: use 'drop_column'
+   - Only include columns that actually have missing values in the strategies JSON
+   - If there are no missing values, skip this step
+6. Call generate_visualization for key insights:
+   - histogram for each numeric column
+   - boxplot for each numeric column (outlier detection)
+   - bar chart for each categorical column
+   - heatmap for correlation (always include this)
+   - scatter for pairs of numeric columns that are strongly correlated (|r| > 0.5)
+7. Compile a clear, structured final report with:
+   - Dataset Overview
+   - Key Statistics & Findings
+   - Missing Data Summary & How It Was Handled
+   - Outliers & Distribution Notes
+   - Correlations
+   - List of all saved visualizations
+   - Recommendations for next steps
+
+Be thorough. Always use the tools — do not guess or fabricate data.
 """
-    ),
-    ("placeholder", "{chat_history}"),
-    ("human", "{input}")
-])
 
-chain = prompt | llm | StrOutputParser()
+tools = [
+    load_dataset,
+    get_dataframe_info,
+    get_statistics,
+    get_missing_values,
+    handle_missing_values,
+    generate_visualization,
+]
 
-response = chain.invoke({
-    "chat_history": chat_history,
-    "input": "How would you perform EDA on my dataset?"
-})
 
-print(f"prompt: {prompt}")
-print("-"*20)
+def create_agent(api_key: str = None):
+    """Create and return the LangGraph react agent with the configured LLM."""
+    if api_key:
+        os.environ["OPENAI_API_KEY"] = api_key
 
-chat_history.append(AIMessage(content=response))
+    llm = ChatOpenAI(
+        model="gpt-4o-mini",
+        temperature=0.1,
+        max_tokens=4096,
+    )
 
-print(f"chat_history: {chat_history}")
-print("-"*20)
-print(f"response: {response}")
+    return create_react_agent(llm, tools, prompt=SYSTEM_PROMPT)
