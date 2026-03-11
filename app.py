@@ -1,4 +1,5 @@
 import os
+import uuid
 import glob
 import shutil
 import tempfile
@@ -6,6 +7,8 @@ import tempfile
 import pandas as pd
 import streamlit as st
 from dotenv import load_dotenv
+from langgraph.checkpoint.memory import MemorySaver
+from llm import create_agent
 
 load_dotenv()
 
@@ -403,7 +406,10 @@ with st.sidebar:
 
     run_btn = st.button(
         "Run EDA Analysis",
-        disabled=(not file_ok or st.session_state.running),
+        disabled=(
+            not file_ok
+            or st.session_state.get("workflow_status") in ("running", "waiting", "resuming")
+        ),
         use_container_width=True,
     )
 
@@ -449,102 +455,165 @@ if uploaded_file is not None and file_ok:
             st.session_state.df = None
 
 
-# ─── Run EDA ─────────────────────────────────────────────────────────────────
+# ─── Run EDA / LangGraph HITL Flow ───────────────────────────────────────────
 api_key = os.getenv("OPENAI_API_KEY", "")
 
+# Graph Initialization & Memory
+if "memory" not in st.session_state:
+    st.session_state.memory = MemorySaver()
+if "thread_id" not in st.session_state:
+    st.session_state.thread_id = str(uuid.uuid4())
+if "workflow_status" not in st.session_state:
+    st.session_state.workflow_status = "init"
+
+config = {"configurable": {"thread_id": st.session_state.thread_id}}
+
+# Run Trigger
 if run_btn and file_ok:
-    # Save the uploaded file to a temporary path
     tmp_dir = tempfile.mkdtemp(prefix="ai_ds_")
     tmp_path = os.path.join(tmp_dir, uploaded_file.name)
     with open(tmp_path, "wb") as fh:
         fh.write(uploaded_file.getbuffer())
 
-    # Clear previous outputs directory
     out_dir = os.path.join(os.getcwd(), "outputs")
     if os.path.exists(out_dir):
         shutil.rmtree(out_dir)
     os.makedirs(out_dir, exist_ok=True)
 
-    # Reset session results
-    st.session_state.report    = None
+    # Reset states for a fresh run
+    st.session_state.tmp_path = tmp_path
+    st.session_state.out_dir = out_dir
+    st.session_state.report = None
     st.session_state.viz_paths = []
-    st.session_state.tool_log  = []
-    st.session_state.error     = None
-    st.session_state.running   = True
+    st.session_state.tool_log = []
+    st.session_state.error = None
+    st.session_state.thread_id = str(uuid.uuid4())
+    config["configurable"]["thread_id"] = st.session_state.thread_id
+    st.session_state.workflow_status = "running"
+    st.rerun()
 
+# Execution & Streaming
+if st.session_state.workflow_status in ["running", "resuming"]:
     try:
-        from llm import create_agent
-        agent = create_agent(api_key=api_key)
+        agent = create_agent(api_key=api_key, memory=st.session_state.memory)
 
-        steps_done: list = []
-
-        with st.status("Running AI Analysis...", expanded=True) as status_box:
+        with st.status("AI Data Scientist is thinking...", expanded=True) as status_box:
             step_area = st.empty()
 
             def _render_steps():
-                badges = []
-                for i, tname in enumerate(steps_done):
-                    lbl = TOOL_LABELS.get(tname, tname)
-                    if i < len(steps_done) - 1:
-                        badges.append(
-                            f'<div class="step-badge done">'
-                            f'{_svg(IC_CHECK,13,"#3fb950")}&nbsp;{lbl}</div>'
-                        )
-                    else:
-                        badges.append(
-                            f'<div class="step-badge active">'
-                            f'<span class="pulse-dot"></span>&nbsp;{lbl} …</div>'
-                        )
-                html = f'<div class="step-badges">{"".join(badges)}</div>'
-                step_area.markdown(html, unsafe_allow_html=True)
-
-            final_report = ""
-
-            for chunk in agent.stream({
-                "messages": [
-                    ("human", f"Please perform a full EDA on the dataset at: {tmp_path}")
-                ]
-            }):
-                if "agent" in chunk:
-                    for msg in chunk["agent"]["messages"]:
-                        if hasattr(msg, "tool_calls") and msg.tool_calls:
-                            for tc in msg.tool_calls:
-                                steps_done.append(tc["name"])
-                                _render_steps()
-                        elif hasattr(msg, "content") and msg.content:
-                            final_report = msg.content
-
-            # Mark last step as done (all green)
-            if steps_done:
-                last = steps_done[-1]
-                steps_done[-1] = "__done__"
-                all_names = [s for s in steps_done if s != "__done__"] + [last]
+                if not st.session_state.tool_log:
+                    return
                 badges = [
                     f'<div class="step-badge done">{_svg(IC_CHECK,13,"#3fb950")}&nbsp;{TOOL_LABELS.get(t,t)}</div>'
-                    for t in all_names
+                    for t in st.session_state.tool_log
                 ]
                 step_area.markdown(
                     f'<div class="step-badges">{"".join(badges)}</div>',
                     unsafe_allow_html=True,
                 )
 
-            st.session_state.report    = final_report
-            st.session_state.tool_log  = all_names if steps_done else []
-            st.session_state.viz_paths = collect_visualizations(out_dir)
-            st.session_state.running   = False
-            status_box.update(label="Analysis complete", state="complete", expanded=False)
+            _render_steps()
+
+            # If starting fresh, provide initial instruction. If resuming, pass None.
+            inputs = None
+            if st.session_state.workflow_status == "running":
+                inputs = {
+                    "messages": [
+                        (
+                            "human",
+                            f"Please perform a full EDA on the dataset at: {st.session_state.tmp_path}",
+                        )
+                    ]
+                }
+
+            # Stream the graph updates
+            for event in agent.stream(inputs, config=config, stream_mode="updates"):
+                if "automated_tools" in event:
+                    for msg in event["automated_tools"]["messages"]:
+                        if hasattr(msg, "name"):
+                            st.session_state.tool_log.append(msg.name)
+                    _render_steps()
+
+                if "agent" in event:
+                    msg = event["agent"]["messages"][0]
+                    if getattr(msg, "content", None):
+                        st.session_state.report = msg.content
+
+            # Graph paused or finished. Check next state.
+            state = agent.get_state(config)
+            if state.next and "ask_human" in state.next:
+                st.session_state.workflow_status = "waiting"
+                status_box.update(
+                    label="Paused for human input",
+                    state="complete",
+                    expanded=False,
+                )
+            else:
+                st.session_state.workflow_status = "complete"
+                st.session_state.viz_paths = collect_visualizations(
+                    st.session_state.out_dir
+                )
+                status_box.update(
+                    label="Analysis complete",
+                    state="complete",
+                    expanded=False,
+                )
+
+        st.rerun()
 
     except Exception as exc:
-        st.session_state.error   = str(exc)
-        st.session_state.running = False
+        st.session_state.error = str(exc)
+        st.session_state.workflow_status = "error"
         st.error(f"Analysis failed: {exc}")
-    finally:
-        try:
-            shutil.rmtree(tmp_dir)
-        except Exception:
-            pass
 
-    st.rerun()
+# Human in the Loop Interruption UI
+if st.session_state.workflow_status == "waiting":
+    agent = create_agent(api_key=api_key, memory=st.session_state.memory)
+    state = agent.get_state(config)
+    last_msg = state.values["messages"][-1]
+
+    # Extract the tool call arguments the LLM asked for
+    ask_call = next(
+        (tc for tc in last_msg.tool_calls if tc["name"] == "ask_human"), None
+    )
+
+    if ask_call:
+        st.markdown(
+            """<div class="feature-card" style="border-color: #d29922; margin-bottom: 20px;">
+            <h3 style="color: #d29922; margin-top: 0; font-size: 1.1rem;">🛑 Clarification Needed</h3>
+        </div>""",
+            unsafe_allow_html=True,
+        )
+
+        st.info(
+            ask_call["args"].get(
+                "question", "I need some clarification to proceed."
+            )
+        )
+        options = ask_call["args"].get("options", [])
+
+        with st.form("clarification_form"):
+            selected = st.radio("Select an option:", options) if options else None
+            custom = st.text_input(
+                "Or type your own instructions (overrides selection):"
+            )
+
+            if st.form_submit_button("Submit & Resume Analysis"):
+                answer = custom if custom else selected
+
+                # Mock the tool response to satisfy the agent's tool call requirement
+                tool_msg = {
+                    "role": "tool",
+                    "content": str(answer),
+                    "tool_call_id": ask_call["id"],
+                    "name": "ask_human",
+                }
+                # Update the state simulating that 'ask_human' node executed
+                agent.update_state(
+                    config, {"messages": [tool_msg]}, as_node="ask_human"
+                )
+                st.session_state.workflow_status = "resuming"
+                st.rerun()
 
 
 # ─── Content Area ─────────────────────────────────────────────────────────────
